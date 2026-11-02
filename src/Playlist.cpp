@@ -217,5 +217,6 @@ bool CPlaylist::IsPlayListFile(LPCTSTR path)
 bool CPlaylist::IsMediaFile(LPCTSTR path)
 {
     LPCTSTR ext = ::PathFindExtension(path);
-    return !_tcsicmp(ext, TEXT(".ts")) || !_tcsicmp(ext, TEXT(".m2t")) || !_tcsicmp(ext, TEXT(".m2ts")) || !_tcsicmp(ext, TEXT(".mp4"));
+    return !_tcsicmp(ext, TEXT(".ts")) || !_tcsicmp(ext, TEXT(".m2t")) || !_tcsicmp(ext, TEXT(".m2ts")) ||
+           !_tcsicmp(ext, TEXT(".mmts")) || !_tcsicmp(ext, TEXT(".tlv")) || !_tcsicmp(ext, TEXT(".mp4"));
 }

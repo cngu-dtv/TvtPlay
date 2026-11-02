@@ -1,0 +1,37 @@
+# Visual Studio build output
+[Dd]ebug/
+[Rr]elease/
+x64/
+Win32/
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.res
+*.tlog
+*.lastbuildstate
+*.recipe
+*.log
+*.tvtp
+*.dll
+*.exe
+
+# Visual Studio user settings / cache
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.aps
+
+# Editors
+*.swp
+*~
+Thumbs.db
+.DS_Store

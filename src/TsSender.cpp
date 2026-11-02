@@ -139,6 +139,8 @@ CTsSender::CTsSender()
     , m_head(nullptr)
     , m_tail(nullptr)
     , m_unitSize(0)
+    , m_fTlv(false)
+    , m_supposedRate(TS_SUPPOSED_RATE)
     , m_fTrimPacket(false)
     , m_fUnderrunCtrl(false)
     , m_pcrDisconThreshold(0xffffffff)
@@ -220,15 +222,40 @@ bool CTsSender::Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, boo
     }
     m_reader.SetFile(m_file.get());
 
+    std::vector<BYTE> head(TLV_DETECT_SIZE);
+    int headBytes = m_file->Read(head.data(), TLV_DETECT_SIZE);
     BYTE buf[8192];
-    int readBytes = m_file->Read(buf, sizeof(buf));
+    int readBytes = headBytes < 0 ? -1 : min(headBytes, static_cast<int>(sizeof(buf)));
+    BYTE *hashHead = buf;
+    int hashLen = readBytes;
     if (readBytes < 0) goto ERROR_EXIT;
+    memcpy(buf, head.data(), readBytes);
 
+    m_fTlv = false;
     if (!fMpeg4) {
-        // TSパケットの単位を決定
-        m_unitSize = select_unit_size(buf, buf + readBytes);
-        if (m_unitSize < 188 || 320 < m_unitSize) goto ERROR_EXIT;
+        // TLV(ARIB STD-B32)か調べる。同期位置以降の大半がTLVパケットの連鎖ならTLVとみなす
+        // (ドロップで連鎖が途切れることがある。先頭に残った別形式のデータがTSの同期パターンに
+        //  見えることがあるのでTSの判定より優先する)
+        bool fNeedMore;
+        BYTE *pSync = resync_tlv(head.data(), head.data() + headBytes, &fNeedMore);
+        if (pSync && !fNeedMore &&
+            tlv_chain_coverage(pSync, head.data() + headBytes) >= (head.data() + headBytes - pSync) / 2) {
+            m_fTlv = true;
+            // バッファ確保量の基準にだけ使う
+            m_unitSize = 188;
+            // 同期位置からハッシュをとる
+            hashHead = pSync;
+            hashLen = min(headBytes - static_cast<int>(pSync - head.data()), static_cast<int>(sizeof(buf)));
+        }
+        else {
+            // TSパケットの単位を決定
+            m_unitSize = select_unit_size(buf, buf + readBytes);
+            if (m_unitSize < 188 || 320 < m_unitSize) goto ERROR_EXIT;
+        }
     }
+    m_supposedRate = m_fTlv ? TLV_SUPPOSED_RATE : TS_SUPPOSED_RATE;
+    m_carry.assign(m_fTlv ? TLV_CARRY_MAX : 320, 0);
+    m_tlvCidPort.assign(TLV_CID_MAX, 0);
 
     // 転送時にパケットを188Byteに詰めるかどうか
     // TimestampedTS(192Byte)の場合のみ変換する
@@ -238,7 +265,7 @@ bool CTsSender::Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, boo
     m_fUnderrunCtrl = fUnderrunCtrl;
 
     // 識別情報としてファイル先頭の56bitハッシュ値をとる
-    m_hash = CalcHash(buf, readBytes, salt, &m_oldHash);
+    m_hash = CalcHash(hashHead, hashLen, salt, &m_oldHash);
     // 旧仕様のハッシュ値と区別するため
     m_hash |= 1LL << 56;
 
@@ -249,7 +276,7 @@ bool CTsSender::Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, boo
 
     // バッファ確保
     int bufNum = max(bufSize / (m_unitSize*BUFFER_LEN), 1);
-    if (!m_reader.SetupBuffer(m_unitSize*BUFFER_LEN, m_unitSize, bufNum)) {
+    if (!m_reader.SetupBuffer(m_unitSize*BUFFER_LEN, m_fTlv ? TLV_CARRY_MAX : m_unitSize, bufNum)) {
         goto ERROR_EXIT;
     }
 
@@ -283,7 +310,7 @@ bool CTsSender::Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, boo
         m_duration = 0;
         // 最大で標準的なTSの末尾8秒間を調べる
         for (int sec = 1; sec <= 8; sec *= 2) {
-            if (Seek(-TS_SUPPOSED_RATE * sec, IReadOnlyFile::MOVE_METHOD_END)) {
+            if (Seek(-m_supposedRate * sec, IReadOnlyFile::MOVE_METHOD_END)) {
                 // ファイル末尾が正常である場合
                 __int64 startPos = m_reader.GetFilePosition();
                 if (startPos >= 0) {
@@ -291,7 +318,7 @@ bool CTsSender::Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, boo
                     while (ReadToPcr(false, true)) {
                         m_duration = DiffPcr(m_pcr, m_initPcr) / PCR_PER_MSEC;
                          __int64 filePos = m_reader.GetFilePosition();
-                         if (filePos < startPos || filePos > startPos + TS_SUPPOSED_RATE * sec) {
+                         if (filePos < startPos || filePos > startPos + m_supposedRate * sec) {
                              // 追記された等。想定以上は読まない
                              break;
                          }
@@ -306,12 +333,12 @@ bool CTsSender::Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, boo
             // 書き込み共有かつファイル末尾が正常でない場合
             __int64 filePos = m_reader.GetFilePosition();
             for (int sec = 2; sec <= 8; sec *= 2) {
-                if (Seek(filePos - TS_SUPPOSED_RATE * sec, IReadOnlyFile::MOVE_METHOD_BEGIN)) {
+                if (Seek(filePos - m_supposedRate * sec, IReadOnlyFile::MOVE_METHOD_BEGIN)) {
                     filePos = m_reader.GetFilePosition();
                     m_duration = (int)(DiffPcr(m_pcr, m_initPcr) / PCR_PER_MSEC) + 1000 * sec;
                     // ファイルサイズからレートを計算できないため
-                    m_specialExtendInitRate = filePos < 0 || m_duration <= 0 ? TS_SUPPOSED_RATE :
-                                              static_cast<int>((filePos + TS_SUPPOSED_RATE * sec) * 1000 / m_duration);
+                    m_specialExtendInitRate = filePos < 0 || m_duration <= 0 ? m_supposedRate :
+                                              static_cast<int>((filePos + m_supposedRate * sec) * 1000 / m_duration);
                     m_fileState = FILE_ST_SPECIAL_EXTENDING;
                     break;
                 }
@@ -324,7 +351,8 @@ bool CTsSender::Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, boo
     }
 
     // 再生レートが極端に小さい場合(ワンセグ等)はバッファを縮める
-    if (GetRate() < m_unitSize*BUFFER_LEN) {
+    // TLVはパケットが最大64KBなので縮めない
+    if (!m_fTlv && GetRate() < m_unitSize*BUFFER_LEN) {
         if (!m_reader.SetupBuffer(GetRate() / m_unitSize * m_unitSize, m_unitSize, bufNum)) {
             goto ERROR_EXIT;
         }
@@ -588,12 +616,24 @@ static const BYTE EMPTY_PAT[] = {
 };
 
 // PMTリストが空のPATを送る
+// TLVではNULLパケット(ARIB STD-B32 第3部 表3-2)を送る
 void CTsSender::SendEmptyPat()
 {
     if (!IsOpen()) return;
     ASSERT(m_unitSize <= 320);
 
     BYTE buf[320 * 9];
+    if (m_fTlv) {
+        memset(buf, 0xFF, 188 * 9);
+        for (int i = 0; i < 9; ++i) {
+            buf[188*i] = 0x7F;
+            buf[188*i+1] = 0xFF;
+            buf[188*i+2] = 0x00;
+            buf[188*i+3] = 188 - TLV_HEADER_SIZE;
+        }
+        SendData(buf, 188 * 9);
+        return;
+    }
     int unitSize = m_fTrimPacket ? 188 : m_unitSize;
 
     // 同期できるようにNULLパケットで囲っておく
@@ -822,10 +862,10 @@ int CTsSender::GetRate() const
     }
     else {
         __int64 fileSize = m_reader.GetFileSize();
-        rate = fileSize < 0 || m_duration <= 0 ? TS_SUPPOSED_RATE :
+        rate = fileSize < 0 || m_duration <= 0 ? m_supposedRate :
                static_cast<int>(fileSize * 1000 / m_duration);
     }
-    return min(max(rate, TS_SUPPOSED_RATE/128), TS_SUPPOSED_RATE*12);
+    return min(max(rate, m_supposedRate/128), m_supposedRate*12);
 }
 
 
@@ -844,6 +884,8 @@ DWORD CTsSender::GetAdjTickCount()
 // 戻り値: false:終端に達したかPCRが現れる前に処理パケット数が上限に達した, true:正常に処理した
 bool CTsSender::ReadToPcr(bool fSend, bool fSyncRead)
 {
+    if (m_fTlv) return ReadToNtp(fSend, fSyncRead);
+
     MAGIC_NUMBER(0x76389426);
     bool fPcr = false;
     for (int limit = READ_TO_PCR_LIMIT_PACKETS; !fPcr && limit > 0; --limit) {
@@ -953,10 +995,84 @@ bool CTsSender::ReadToPcr(bool fSend, bool fSyncRead)
 }
 
 
-// 処理済みのTSパケットを転送し、必要ならファイルから読み込む
-void CTsSender::RotateBuffer(bool fSend, bool fSyncRead)
+// NTPパケットが現れるまでTLVパケットを処理する(ReadToPcr()のTLV版)
+bool CTsSender::ReadToNtp(bool fSend, bool fSyncRead)
+{
+    bool fNtp = false;
+    for (int limit = READ_TO_PCR_LIMIT_PACKETS; !fNtp && limit > 0; --limit) {
+        if (!m_curr || m_tail - m_curr < TLV_HEADER_SIZE) {
+            RotateBuffer(fSend, fSyncRead, TLV_HEADER_SIZE);
+            if (!m_curr || m_tail - m_curr < TLV_HEADER_SIZE) {
+                return false;
+            }
+        }
+
+        if (!is_tlv_header(m_curr)) {
+            // m_currをパケットヘッダと同期させる
+            int i = 0;
+            for (; i < RESYNC_FAILURE_LIMIT; ++i) {
+                bool fNeedMore;
+                BYTE *p = resync_tlv(m_curr, m_tail, &fNeedMore);
+                if (p && !fNeedMore) {
+                    m_curr = p;
+                    break;
+                }
+                // 候補の手前までを処理済みにして読み足す
+                m_curr = p ? p : m_tail;
+                RotateBuffer(fSend, fSyncRead, TLV_CARRY_MAX);
+                if (!m_curr) return false;
+            }
+            if (i == RESYNC_FAILURE_LIMIT) return false;
+        }
+
+        int size = tlv_packet_size(m_curr);
+        if (m_tail - m_curr < size) {
+            RotateBuffer(fSend, fSyncRead, size);
+            if (!m_curr || m_tail - m_curr < size) {
+                return false;
+            }
+        }
+
+        int dstPort;
+        int offset = extract_tlv_udp_payload(m_curr, size, m_tlvCidPort.data(), &dstPort);
+        if (offset >= 0 && dstPort == NTP_PORT) {
+            unsigned int clock;
+            long long unixTime;
+            if (extract_tlv_ntp(m_curr + offset, size - offset, &clock, &unixTime)) {
+                m_pcr = clock;
+                if (!m_fEnPcr) {
+                    // 基準PCRを設定(受信側のストアを増やすため少し引く)
+                    m_baseTick = GetAdjTickCount() - m_initStore;
+                    m_basePcr = m_pcr;
+                    m_rateCtrlMsec = 0;
+                    m_fEnPcr = true;
+                }
+                // NTPは絶対時刻なのでTOT相当にもなる
+                m_totBaseUnixTime = unixTime;
+                m_totBasePcr = m_pcr;
+                fNtp = true;
+            }
+        }
+
+        m_curr += size;
+
+        // あまり貯めすぎると再生に影響するため
+        if (m_curr - m_head >= BON_UDP_TSDATASIZE - 1880 ||
+            (fSend && CounterDiff(m_pcr, m_lastSentPcr) >= MAX_SEND_INTERVAL))
+        {
+            RotateBuffer(fSend, fSyncRead, TLV_HEADER_SIZE);
+        }
+    }
+    return fNtp;
+}
+
+
+// 処理済みのパケットを転送し、必要ならファイルから読み込む
+// needBytes: 読み込みが必要と判断する未処理データ量(0ならTSパケット1つ分)
+void CTsSender::RotateBuffer(bool fSend, bool fSyncRead, int needBytes)
 {
     ASSERT(IsOpen() && m_unitSize <= 320);
+    if (needBytes <= 0) needBytes = m_unitSize + 1;
 
     // m_curr:パケット処理位置, m_head:転送開始位置, m_tail:有効データの末尾
     if (fSend && m_curr && m_curr > m_head) {
@@ -979,11 +1095,11 @@ void CTsSender::RotateBuffer(bool fSend, bool fSyncRead)
     m_head = m_curr;
 
     // パケットを処理するだけのデータがなければ読む
-    if (!m_curr || m_tail - m_curr <= m_unitSize) {
+    if (!m_curr || m_tail - m_curr < needBytes) {
         // この繰越し処理によりm_headとパケットヘッダは同期する
-        BYTE carry[320];
         int carrySize = !m_curr ? 0 : static_cast<int>(m_tail - m_curr);
-        if (carrySize > 0) memcpy(carry, m_curr, carrySize);
+        ASSERT(carrySize <= static_cast<int>(m_carry.size()));
+        if (carrySize > 0) memcpy(m_carry.data(), m_curr, carrySize);
 
         BYTE *pBuf;
         int readBytes = fSyncRead ? m_reader.SyncRead(&pBuf) : m_reader.Read(&pBuf);
@@ -993,7 +1109,7 @@ void CTsSender::RotateBuffer(bool fSend, bool fSyncRead)
         else {
             m_curr = m_head = pBuf - carrySize;
             m_tail = pBuf + readBytes;
-            if (carrySize > 0) memcpy(m_curr, carry, carrySize);
+            if (carrySize > 0) memcpy(m_curr, m_carry.data(), carrySize);
         }
     }
 }
@@ -1009,7 +1125,7 @@ bool CTsSender::Seek(__int64 distanceToMove, IReadOnlyFile::MOVE_METHOD moveMeth
 
     // 同期済みのファイルがなるべく同期済みのままになるよう移動量をパケット単位にする
     __int64 moveUnits = distanceToMove < 0 ? -(-distanceToMove / m_unitSize) : distanceToMove / m_unitSize;
-    if (m_file->SetPointer(moveUnits * m_unitSize, moveMethod) < 0) return false;
+    if (m_file->SetPointer(m_fTlv ? distanceToMove : moveUnits * m_unitSize, moveMethod) < 0) return false;
 
     m_curr = m_head = m_tail = nullptr;
     m_fEnPcr = false;
@@ -1038,14 +1154,21 @@ bool CTsSender::SeekToBoundary(__int64 predicted, __int64 range, BYTE *pWork, in
     m_reader.Flush();
     if (m_file->SetPointer(predicted, IReadOnlyFile::MOVE_METHOD_BEGIN) < 0) return false;
 
-    if (range < TS_SUPPOSED_RATE) return true;
+    if (range < m_supposedRate) return true;
 
     int readBytes = m_file->Read(pWork, workSize);
     if (readBytes < 0) return false;
-    int unitSize = select_unit_size(pWork, pWork + readBytes);
+    bool fFound;
+    if (m_fTlv) {
+        bool fNeedMore;
+        fFound = resync_tlv(pWork, pWork + readBytes, &fNeedMore) != nullptr && !fNeedMore;
+    }
+    else {
+        fFound = select_unit_size(pWork, pWork + readBytes) >= 188;
+    }
 
     ::Sleep(20); // ディスクへの思いやり
-    return SeekToBoundary(predicted + (unitSize < 188 ? -range/4 : range/4), range/2, pWork, workSize);
+    return SeekToBoundary(predicted + (fFound ? range/4 : -range/4), range/2, pWork, workSize);
 }
 
 
@@ -1126,8 +1249,8 @@ void CTsSender::SendData(BYTE *pData, int dataSize)
             addr.sin_family = AF_INET;
             addr.sin_port = htons(m_udpPort);
             addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            // BonDriver_UDPのキューサイズ以下に分割して送る
-            int sendUnit = (BON_UDP_TSDATASIZE-1880) / m_unitSize * m_unitSize;
+            // BonDriver_UDPのキューサイズ以下に分割して送る(TLVはパケット境界を問わない)
+            int sendUnit = m_fTlv ? BON_UDP_TSDATASIZE-1880 : (BON_UDP_TSDATASIZE-1880) / m_unitSize * m_unitSize;
             for (BYTE *p = pData; p < pData + dataSize; p += sendUnit) {
                 int sendSize = min(sendUnit, (int)(pData + dataSize - p));
                 if (::sendto(m_sock, (const char*)p, sendSize, 0,

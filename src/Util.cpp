@@ -563,6 +563,113 @@ unsigned char *resync(unsigned char *head, unsigned char *tail, int unit_size)
 	return nullptr;
 }
 
+// TLVパケットの先頭に同期する
+// 連鎖する2つ以上のヘッダを確認できた位置を返す。確認に足りるデータがなければ候補の
+// 位置を返して*pfNeedMoreをtrueにする。見つからなければnullptr
+unsigned char *resync_tlv(unsigned char *head, unsigned char *tail, bool *pfNeedMore)
+{
+    *pfNeedMore = false;
+    for (unsigned char *p = head; p < tail; ++p) {
+        if (p[0] != 0x7F) continue;
+        if (tail - p < TLV_HEADER_SIZE) {
+            *pfNeedMore = true;
+            return p;
+        }
+        if (!is_tlv_header(p)) continue;
+        int verified = 0;
+        unsigned char *q = p;
+        while (tail - q >= TLV_HEADER_SIZE) {
+            if (!is_tlv_header(q)) {
+                verified = -1;
+                break;
+            }
+            if (++verified >= 3) break;
+            q += tlv_packet_size(q);
+        }
+        if (verified >= 2) return p;
+        if (verified == 1) {
+            *pfNeedMore = true;
+            return p;
+        }
+    }
+    return nullptr;
+}
+
+// [head, tail)のうち連鎖するTLVパケットで占められるバイト数を返す(途切れたら再同期して続ける)
+// TSのペイロードが偶然TLVヘッダの連鎖に見えても短いので、形式判定の裏付けに使う
+int tlv_chain_coverage(unsigned char *head, unsigned char *tail)
+{
+    int covered = 0;
+    unsigned char *q = head;
+    while (tail - q >= TLV_HEADER_SIZE) {
+        if (!is_tlv_header(q)) {
+            bool fNeedMore;
+            q = resync_tlv(q, tail, &fNeedMore);
+            if (!q || fNeedMore) break;
+        }
+        int size = tlv_packet_size(q);
+        if (tail - q < size) break;
+        covered += size;
+        q += size;
+    }
+    return covered;
+}
+
+// TLVパケットからUDPペイロードの位置を得る(IPv6とIPヘッダ圧縮)
+// 圧縮ヘッダのポートはCIDごとに完全ヘッダから引き継ぐ(ARIB STD-B32 第3部 3.7)
+// 戻り値: パケット先頭からのオフセット、UDPでないか不明なら-1
+int extract_tlv_udp_payload(const unsigned char *packet, int size, unsigned short *cidPortTable, int *pDstPort)
+{
+    const unsigned char *p = packet + TLV_HEADER_SIZE;
+    int len = size - TLV_HEADER_SIZE;
+    if (packet[1] == 0x02) {
+        // IPv6ヘッダ(40) + UDPヘッダ(8)
+        if (len < 48 || (p[0] >> 4) != 6 || p[6] != 17) return -1;
+        *pDstPort = p[42] << 8 | p[43];
+        return TLV_HEADER_SIZE + 48;
+    }
+    if (packet[1] == 0x03) {
+        // CID(12) + SN(4) + CID_header_type(8)
+        if (len < 3) return -1;
+        int cid = p[0] << 4 | p[1] >> 4;
+        switch (p[2]) {
+        case 0x60: // IPv6ヘッダ(payload_lengthを除く38) + UDPヘッダ(ポートのみ4)
+            if (len < 3 + 38 + 4) return -1;
+            cidPortTable[cid] = p[3 + 38 + 2] << 8 | p[3 + 38 + 3];
+            *pDstPort = cidPortTable[cid];
+            return TLV_HEADER_SIZE + 3 + 38 + 4;
+        case 0x61:
+            if (cidPortTable[cid] == 0) return -1;
+            *pDstPort = cidPortTable[cid];
+            return TLV_HEADER_SIZE + 3;
+        case 0x20: // IPv4ヘッダ(total_lengthとchecksumを除く16) + UDPヘッダ(ポートのみ4)
+            if (len < 3 + 16 + 4) return -1;
+            cidPortTable[cid] = p[3 + 16 + 2] << 8 | p[3 + 16 + 3];
+            *pDstPort = cidPortTable[cid];
+            return TLV_HEADER_SIZE + 3 + 16 + 4;
+        case 0x21: // IPv4のidentification(2)
+            if (cidPortTable[cid] == 0) return -1;
+            *pDstPort = cidPortTable[cid];
+            return TLV_HEADER_SIZE + 3 + 2;
+        }
+    }
+    return -1;
+}
+
+// NTPパケットの送信タイムスタンプを取得する(RFC 5905)
+// PCRと同じ45kHz単位の32ビット値と、UNIX時間(秒)を返す
+bool extract_tlv_ntp(const unsigned char *payload, int payloadSize, unsigned int *pClock45khz, long long *pUnixTime)
+{
+    if (payloadSize < 48) return false;
+    unsigned int secs = (unsigned int)payload[40] << 24 | payload[41] << 16 | payload[42] << 8 | payload[43];
+    unsigned int frac = (unsigned int)payload[44] << 24 | payload[45] << 16 | payload[46] << 8 | payload[47];
+    if (secs == 0) return false;
+    *pClock45khz = (unsigned int)(secs * 45000ULL + (frac * 45000ULL >> 32));
+    // 1900年起点。2036年以降は第1紀元(RFC 5905 Sec.6)
+    *pUnixTime = (secs >= 2208988800U ? (long long)secs : (long long)secs + 0x100000000LL) - 2208988800LL;
+    return true;
+}
+
 void extract_adaptation_field(ADAPTATION_FIELD *dst, const unsigned char *data)
 {
 	const unsigned char *p;

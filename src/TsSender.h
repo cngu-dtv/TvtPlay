@@ -30,6 +30,9 @@ class CTsSender
     static const int BUFFER_LEN = 1536;
     static const int BON_UDP_TSDATASIZE = 48128;
     static const int TS_SUPPOSED_RATE = 2 * 1024 * 1024;
+    static const int TLV_SUPPOSED_RATE = 4 * 1024 * 1024;
+    static const int TLV_DETECT_SIZE = 1024 * 1024;
+    static const int TLV_CARRY_MAX = TLV_PACKET_MAX_SIZE + TLV_HEADER_SIZE;
     static const int PCR_PIDS_MAX = 8;
     static const int RESYNC_FAILURE_LIMIT = 2;
     static const int RENEW_SIZE_INTERVAL = 3000;
@@ -61,6 +64,7 @@ public:
     void Pause(bool fPause, bool fPurge = true);
     void SetSpeed(int num, int den);
     bool IsOpen() const { return m_file != nullptr; }
+    bool IsTlv() const { return m_fTlv; }
     bool IsPaused() const { return m_fPause; }
     bool IsFixed(bool *pfSpecialExt = nullptr) const { if (pfSpecialExt) *pfSpecialExt=m_fileState==FILE_ST_SPECIAL_EXTENDING; return m_fileState==FILE_ST_FIXED; }
     void GetSpeed(int *pNum, int *pDen) const { *pNum=m_speedNum; *pDen=m_speedDen; }
@@ -74,7 +78,8 @@ public:
 private:
     DWORD GetAdjTickCount();
     bool ReadToPcr(bool fSend, bool fSyncRead);
-    void RotateBuffer(bool fSend, bool fSyncRead);
+    bool ReadToNtp(bool fSend, bool fSyncRead);
+    void RotateBuffer(bool fSend, bool fSyncRead, int needBytes = 0);
     bool Seek(__int64 distanceToMove, IReadOnlyFile::MOVE_METHOD moveMethod);
     bool SeekToBoundary(__int64 predicted, __int64 range, BYTE *pWork, int workSize);
     void OpenSocket();
@@ -90,6 +95,10 @@ private:
     CBufferedFileReader m_reader;
     BYTE *m_curr, *m_head, *m_tail;
     int m_unitSize;
+    bool m_fTlv;
+    int m_supposedRate;
+    std::vector<BYTE> m_carry;
+    std::vector<unsigned short> m_tlvCidPort;
     bool m_fTrimPacket, m_fUnderrunCtrl;
     DWORD m_pcrDisconThreshold;
     CTsTimestampShifter m_tsShifter;

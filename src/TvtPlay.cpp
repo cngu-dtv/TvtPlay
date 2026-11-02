@@ -1081,7 +1081,7 @@ bool CTvtPlay::OpenWithDialog()
     OPENFILENAME ofn = {};
     ofn.lStructSize = sizeof(OPENFILENAME);
     ofn.hwndOwner   = hwndOwner;
-    ofn.lpstrFilter = TEXT("再生可能なメディア(*.ts;*.m2t;*.m2ts;*.mp4;*.m3u;*.tslist)\0*.ts;*.m2t;*.m2ts;*.mp4;*.m3u;*.tslist\0すべてのファイル\0*.*\0");
+    ofn.lpstrFilter = TEXT("再生可能なメディア(*.ts;*.m2t;*.m2ts;*.mmts;*.tlv;*.mp4;*.m3u;*.tslist)\0*.ts;*.m2t;*.m2ts;*.mmts;*.tlv;*.mp4;*.m3u;*.tslist\0すべてのファイル\0*.*\0");
     ofn.lpstrTitle  = TEXT("ファイルを開く");
     // MSDN記述と違いOFN_NOCHANGEDIRはGetOpenFileName()にも効果がある模様
     ofn.Flags       = OFN_HIDEREADONLY | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR |
@@ -2944,6 +2944,9 @@ BOOL CALLBACK CTvtPlay::StreamCallback(BYTE *pData, void *pClientData)
 #endif
         t.m_fResetPat = false;
     }
+
+    // TLVパケットも同じコールバックで渡されるのでTS以外は処理しない
+    if (pData[0] != 0x47) return TRUE;
 
     // PCR/PTS/DTSを変更
     t.m_tsShifter.Transform(pData);

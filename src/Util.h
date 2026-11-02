@@ -116,6 +116,27 @@ void extract_pes_header(PES_HEADER *dst, const unsigned char *payload, int paylo
 
 int select_unit_size(unsigned char *head, unsigned char *tail);
 unsigned char *resync(unsigned char *head, unsigned char *tail, int unit_size);
+
+// TLVパケット(ARIB STD-B32 第3部): 0x7F, packet_type, data_length(16bit), data
+static const int TLV_HEADER_SIZE = 4;
+static const int TLV_PACKET_MAX_SIZE = TLV_HEADER_SIZE + 0xFFFF;
+static const int TLV_CID_MAX = 4096;
+static const int NTP_PORT = 123;
+
+inline bool is_tlv_header(const unsigned char *p)
+{
+    return p[0] == 0x7F && (p[1] == 0x01 || p[1] == 0x02 || p[1] == 0x03 || p[1] == 0xFE || p[1] == 0xFF);
+}
+
+inline int tlv_packet_size(const unsigned char *p)
+{
+    return TLV_HEADER_SIZE + (p[2] << 8 | p[3]);
+}
+
+unsigned char *resync_tlv(unsigned char *head, unsigned char *tail, bool *pfNeedMore);
+int tlv_chain_coverage(unsigned char *head, unsigned char *tail);
+int extract_tlv_udp_payload(const unsigned char *packet, int size, unsigned short *cidPortTable, int *pDstPort);
+bool extract_tlv_ntp(const unsigned char *payload, int payloadSize, unsigned int *pClock45khz, long long *pUnixTime);
 void extract_adaptation_field(ADAPTATION_FIELD *dst, const unsigned char *data);
 
 inline void extract_ts_header(TS_HEADER *dst, const unsigned char *packet)
